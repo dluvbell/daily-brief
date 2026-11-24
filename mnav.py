@@ -47,3 +47,16 @@ if any([a.cash, a.btc, a.other, a.pref, a.liab]):
 print(f"[민감도] 주식 수 ±3%: mNAV(ETH만) {mcap*0.97/ethv:.3f} ~ {mcap*1.03/ethv:.3f}")
 print(f"[손익분기] mNAV=1 되는 BMNR 가격: ETH만 ${ethv/shares:.2f}" + (f", 넓은 ${nav/shares:.2f}" if nav != ethv else ""))
 print(f"[주당 ETH] 1,000주당 {a.eth/shares*1000:.3f} ETH")
+
+# 실행 시각 기준(프리마켓/애프터 포함 마지막 체결) mNAV — 같은 보유량·주식 수, 가격만 현재값
+def last_px(sym, pp):
+    rr = g(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5d&interval=5m{'&includePrePost=true' if pp else ''}")["chart"]["result"][0]
+    i = pd.to_datetime(rr["timestamp"], unit="s", utc=True).tz_convert("America/New_York")
+    s = pd.Series(rr["indicators"]["quote"][0]["close"], index=i).dropna(); return s.iloc[-1], s.index[-1]
+try:
+    bp, bt = last_px("BMNR", True); ep, et = last_px("ETH-USD", False); bp2 = last_px("BTC-USD", False)[0]
+    mc2 = bp * shares; ev2 = a.eth * ep; nav2 = ev2 + a.cash + a.btc * bp2 + a.other - a.pref - a.liab
+    print(f"[시간외] BMNR ${bp:.2f} ({bt:%m-%d %H:%M} ET) | ETH ${ep:,.2f} ({et:%m-%d %H:%M} ET) -> mNAV(ETH만) {mc2/ev2:.3f}"
+          + (f" | mNAV(넓은) {mc2/nav2:.3f}" if nav2 != ev2 else "") + f" | 종가 기준 대비 할인 변화 {((mc2/nav2)-(mcap/nav))*100:+.1f}%p")
+except Exception as e:
+    print("[시간외] 못 구함:", type(e).__name__)

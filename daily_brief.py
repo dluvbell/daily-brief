@@ -129,7 +129,7 @@ except Exception as e:
 import numpy as np, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import regime as RG
-SNAP = {"버전": "brief-v2 / regime-v1.1 / risk-logit-v1", "기준일": str(R[next(iter(R))]["last"].date()) if R else None,
+SNAP = {"버전": "brief-v2.1 / regime-v1.1 / risk-logit-v1", "기준일": str(R[next(iter(R))]["last"].date()) if R else None,
         "종목": {s: {k: (round(float(v), 4) if isinstance(v, (int, float, np.floating)) else str(v)) for k, v in r.items()} for s, r in R.items()},
         "맥락": CTX}
 def fwd_min(s, n):  # 앞으로 n거래일 중 최저 종가 / 오늘 - 1 (n일이 다 지나야 값이 생김)
@@ -301,5 +301,71 @@ try:
     print("\n[채점용 - BMNR 최근 30거래일 종가]\n " + " | ".join(f"{i}:{d.date()} {v:.2f}" for i, (d, v) in enumerate(bc.items())))
 except Exception as ex:
     print(" BMNR 섹션 실패:", type(ex).__name__, ex)
+
+print("\n\n########## 추가 계산 (brief-v2.1) ##########")
+import numpy as np
+NOW_ET = pd.Timestamp.now(tz="America/New_York")
+
+# 1) 시간외 가격: 브리프 실행 시각의 마지막 체결(프리마켓/애프터마켓 포함)
+def last_trade(sym):
+    r = j(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5d&interval=5m&includePrePost=true")["chart"]["result"][0]
+    i = pd.to_datetime(r["timestamp"], unit="s", utc=True).tz_convert("America/New_York")
+    s = pd.Series(r["indicators"]["quote"][0]["close"], index=i).dropna()
+    return float(s.iloc[-1]), s.index[-1]
+print(f"\n[시간외 가격 - 실행 시각 {NOW_ET:%Y-%m-%d %H:%M} ET, Yahoo 5분봉 프리/애프터 포함]")
+SNAP["시간외"] = {}
+for sym, ref in (("QQQ", R.get("QQQ", {}).get("p")), ("BMNR", globals().get("p_b")), ("ETH-USD", None)):
+    try:
+        px, ts = last_trade(sym)
+        if ref:
+            print(f" {sym} {px:.2f} ({ts:%m-%d %H:%M} ET 체결) | 직전 정규장 종가 {ref:.2f} 대비 {(px/ref-1)*100:+.2f}%")
+            SNAP["시간외"][sym] = {"가격": round(px, 4), "시각": f"{ts:%Y-%m-%d %H:%M}", "종가대비": round((px/ref-1)*100, 2)}
+        else:
+            print(f" {sym} {px:.2f} ({ts:%m-%d %H:%M} ET)"); SNAP["시간외"][sym] = {"가격": round(px, 2), "시각": f"{ts:%Y-%m-%d %H:%M}"}
+    except Exception as e:
+        print(f" {sym}: 못 구함 ({type(e).__name__})")
+
+# 2) BMNR 움직임 분해: ETH는 BMNR 종가와 같은 시각(16:00 ET)으로 맞춤
+#    log(1+BMNR) = log(1+ETH) + 나머지  (나머지 = 할인/프리미엄 변화 + 주당 ETH 변화. 하루짜리는 거의 할인 변화)
+try:
+    r = j("https://query1.finance.yahoo.com/v8/finance/chart/ETH-USD?range=3mo&interval=1h")["chart"]["result"][0]
+    i = pd.to_datetime(r["timestamp"], unit="s", utc=True).tz_convert("America/New_York")
+    eh = pd.Series(r["indicators"]["quote"][0]["close"], index=i).dropna()
+    bcl = b.close.iloc[-30:]
+    e16 = pd.Series({d: eh[eh.index <= pd.Timestamp(d).tz_localize("America/New_York") + pd.Timedelta(hours=15)].iloc[-1] for d in bcl.index})
+    print(f"\n[BMNR 움직임 분해 - ETH = 같은 날 16:00 ET 가격 (1시간봉 15:00~16:00 종가) | 나머지 = 할인 변화 + 주당 ETH 변화]")
+    print(f" ETH 16:00 ET ({bcl.index[-1].date()}): {e16.iloc[-1]:,.2f}  (참고: 시트 'ETH 가격' 칸은 UTC 일봉 종가 = 19:00 ET)")
+    SNAP["BMNR분해"] = {"ETH_16ET": round(float(e16.iloc[-1]), 2)}
+    for n, lab in ((1, "1일"), (5, "5거래일"), (21, "1개월")):
+        lb = np.log(bcl.iloc[-1]/bcl.iloc[-1-n]); le = np.log(e16.iloc[-1]/e16.iloc[-1-n]); rest = lb - le
+        pc = lambda x: (np.exp(x)-1)*100
+        print(f" {lab}: BMNR {pc(lb):+.1f}% = ETH {pc(le):+.1f}% 몫 + 나머지 {pc(rest):+.1f}% ({'할인 축소/주당 ETH 증가 쪽' if rest > 0 else '할인 확대/희석 쪽'})")
+        SNAP["BMNR분해"][lab] = {"BMNR": round(pc(lb), 2), "ETH": round(pc(le), 2), "나머지": round(pc(rest), 2)}
+except Exception as e:
+    print(" BMNR 분해 실패:", type(e).__name__, e)
+
+# 3) 가속도 상태(1차·2차 도함수) + 그 상태 뒤 역사적 위험 — 2026-11-24 검증: 위험 모델에 더하는 예측력 없음. 오독 방지·기록용
+def accel_state(s, k):
+    roc = s.pct_change(k); acc = roc.diff()
+    st = np.select([(roc > 0) & (acc > 0), (roc > 0) & (acc <= 0), (roc <= 0) & (acc > 0), (roc <= 0) & (acc <= 0)],
+                   ["상승·가속", "상승·감속", "하락·감속", "하락·가속"], default="")
+    return pd.Series(st, index=s.index).where(acc.notna()), roc, acc
+try:
+    qd = RG.yfull("QQQ").dropna()
+    qw = qd.resample("W-FRI").last().dropna(); qw = qw[qw.index <= qd.index[-1]]  # 끝나지 않은 주 제외
+    SNAP["가속도"] = {}
+    print("\n[가속도 상태 - 1차 = ROC(속도), 2차 = ROC의 직전 대비 변화(가속) | 2026-11-24 검증: 위험 모델에 더하는 예측력 없음, 오독 방지·기록용]")
+    for nm, s, k, Hn, thr, unit in (("일봉", qd, 20, 10, -0.05, "10거래일"), ("주봉", qw, 4, 4, -0.07, "4주")):
+        st, roc, acc = accel_state(s, k)
+        fmin = pd.concat([s.shift(-i) for i in range(1, Hn+1)], axis=1).min(axis=1)/s - 1
+        ev = (fmin <= thr).where(s.shift(-Hn).notna())
+        h = pd.DataFrame({"st": st, "ev": ev}).dropna()
+        cur = st.iloc[-1]; sub = h[h.st == cur]
+        print(f" {nm}: {k}{'일' if nm=='일봉' else '주'} ROC {roc.iloc[-1]*100:+.2f}% (직전 {roc.iloc[-2]*100:+.2f}%, 변화 {acc.iloc[-1]*100:+.2f}%p) -> {cur} "
+              f"| 이 상태 뒤 {unit} 안 {thr:.0%} 위험 {sub.ev.mean()*100:.0f}% (평소 {h.ev.mean()*100:.0f}%, 독립 약 {len(sub)//Hn}개, {s.index[0].year}~)")
+        SNAP["가속도"][nm] = {"ROC": round(float(roc.iloc[-1])*100, 2), "변화pp": round(float(acc.iloc[-1])*100, 2), "상태": cur,
+                            "상태위험": round(float(sub.ev.mean()), 3), "평소위험": round(float(h.ev.mean()), 3)}
+except Exception as e:
+    print(" 가속도 계산 실패:", type(e).__name__, e)
 
 print("\nSNAPSHOT_JSON: " + json.dumps(SNAP, ensure_ascii=False, default=lambda o: round(float(o), 4) if isinstance(o, (np.floating, np.integer)) else str(o)))
